@@ -210,6 +210,11 @@ class NGP_fw:
         self.out_1 = ti.field(data_type, shape=(self.max_samples_shape,))
         self.temp_hit = ti.field(ti.i32, shape=(self.max_samples_shape,))
 
+        # TODO: 12 is an estimated maximum sample number
+        self.sigma_layer_hid1 = ti.field(data_type, shape=(1, self.max_samples_shape, 64, block_dim))
+        self.sigma_layer_hid2 = ti.field(data_type, shape=(1, self.max_samples_shape, 16, block_dim))
+        
+
         # results buffers
         self.opacity = ti.field(ti.f32, shape=(self.N_rays,))
         self.depth = ti.field(ti.f32, shape=(self.N_rays))
@@ -271,7 +276,7 @@ class NGP_fw:
 
     @staticmethod
     def taichi_init(kernel_profiler):
-        ti.init(arch=arch, offline_cache=True, kernel_profiler=kernel_profiler, enable_fallback=False)
+        ti.init(arch=arch, packed=True, offline_cache=True, kernel_profiler=kernel_profiler, enable_fallback=False)
 
     @staticmethod
     def taichi_print_profiler():
@@ -492,14 +497,12 @@ class NGP_fw:
 
 
     @ti.kernel
-    def sigma_layer(self):
+    def sigma_layer(self, iter_num: int):
         ti.loop_config(block_dim=block_dim)
         for sn in ti.ndrange(self.padd_block_network[None]):
             tid = sn % block_dim
             did_launch_num = self.model_launch[None]
             init_val = tf_vec1(0.0)
-            hid1 = ti.simt.block.SharedArray((64, block_dim), data_type)
-            hid2 = ti.simt.block.SharedArray((16, block_dim), data_type)
 
             if sn < did_launch_num:
 
@@ -508,17 +511,18 @@ class NGP_fw:
                     for j in ti.static(range(32)):
                         temp += self.xyzs_embedding[sn, j] * self.sigma_weights[i*32+j]
 
-                    hid1[i, tid] = temp
+                    self.sigma_layer_hid1[iter_num, sn, i, tid] = temp
                 
                 for i in range(16):
                     temp = init_val[0]
                     for j in ti.static(range(64)):
-                        temp += data_type(ti.max(0.0, hid1[j, tid])) * self.sigma_weights[64*32+i*64+j]
-                    hid2[i, tid] = temp
+                        temp += data_type(ti.max(0.0, self.sigma_layer_hid1[iter_num, sn, j, tid])) * self.sigma_weights[64*32+i*64+j]
+                    self.sigma_layer_hid2[iter_num, sn, i, tid] = temp
 
-                self.out_1[self.temp_hit[sn]] = data_type(ti.exp(hid2[0, tid]))
+
+                self.out_1[self.temp_hit[sn]] = data_type(ti.exp(self.sigma_layer_hid2[iter_num, sn, 0, tid]))
                 for i in ti.static(range(16)):
-                    self.final_embedding[sn, i] = hid2[i, tid]
+                    self.final_embedding[sn, i] = self.sigma_layer_hid2[iter_num, sn, i, tid]
                 
 
     @ti.kernel
@@ -725,7 +729,7 @@ class NGP_fw:
         while samples < max_samples:
             N_alive = self.counter[None]
             if N_alive == 0: break
-
+            # print("samples: ", samples)
             # how many more samples the number of samples add for each ray
             N_samples = max(min(self.N_rays//N_alive, 64), self.min_samples)
             samples += N_samples
@@ -735,7 +739,7 @@ class NGP_fw:
             self.rearange_index(launch_model_total)
             # self.dir_encode()
             self.hash_encode()
-            self.sigma_layer()
+            self.sigma_layer(0)
             self.rgb_layer()
             # self.FullyFusedMLP()
             self.composite_test(N_samples, T_threshold)
