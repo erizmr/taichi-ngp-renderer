@@ -28,7 +28,8 @@ else:
 
 sigma_sm_preload = int(128/block_dim)*24
 rgb_sm_preload = int(128/block_dim)*50
-data_type = ti.f16
+data_type = ti.f32
+# data_type = ti.f16
 np_type = np.float16
 tf_vec3 = ti.types.vector(3, dtype=data_type)
 tf_vec8 = ti.types.vector(8, dtype=data_type)
@@ -204,22 +205,27 @@ class NGP_fw:
         self.N_eff_samples = ti.field(ti.int32, shape=(self.N_rays,))
 
         # intermediate buffers for network
-        self.xyzs_embedding = ti.field(data_type, shape=(self.max_samples_shape, 32))
-        self.final_embedding = ti.field(data_type, shape=(self.max_samples_shape, 16))
-        self.out_3 = ti.field(data_type, shape=(self.max_samples_shape, 3))
-        self.out_1 = ti.field(data_type, shape=(self.max_samples_shape,))
+        self.xyzs_embedding = ti.field(data_type, shape=(12, self.max_samples_shape, 32))
+        self.final_embedding = ti.field(data_type, shape=(12, self.max_samples_shape, 16))
+
+        # TODO: this two should also be unrolled
+        self.out_3 = ti.field(data_type, shape=(12, self.max_samples_shape, 3))
+        self.out_1 = ti.field(data_type, shape=(12, self.max_samples_shape,))
         self.temp_hit = ti.field(ti.i32, shape=(self.max_samples_shape,))
 
         # TODO: 12 is an estimated maximum sample number
-        self.sigma_layer_hid1 = ti.field(data_type, shape=(1, self.max_samples_shape, 64))
-        self.sigma_layer_hid2 = ti.field(data_type, shape=(1, self.max_samples_shape, 16))
-        self.rgb_layer_hid1 = ti.field(data_type, shape=(1, self.max_samples_shape, 64))
-        self.rgb_layer_hid2 = ti.field(data_type, shape=(1, self.max_samples_shape, 64))
+        self.sigma_layer_hid1 = ti.field(data_type, shape=(12, self.max_samples_shape, 64))
+        self.sigma_layer_hid2 = ti.field(data_type, shape=(12, self.max_samples_shape, 16))
+        self.rgb_layer_hid1 = ti.field(data_type, shape=(12, self.max_samples_shape, 64))
+        self.rgb_layer_hid2 = ti.field(data_type, shape=(12, self.max_samples_shape, 64))
+        self.loss = ti.field(data_type, shape=())
 
         # results buffers
         self.opacity = ti.field(ti.f32, shape=(self.N_rays,))
         self.depth = ti.field(ti.f32, shape=(self.N_rays))
         self.rgb = ti.Vector.field(3, dtype=ti.f32, shape=(self.N_rays,))
+
+        ti.root.lazy_grad()
 
         # GUI render buffer (data type must be float32)
         self.render_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(res[0], res[1],))
@@ -277,7 +283,7 @@ class NGP_fw:
 
     @staticmethod
     def taichi_init(kernel_profiler):
-        ti.init(arch=arch, packed=True, offline_cache=True, kernel_profiler=kernel_profiler, enable_fallback=False)
+        ti.init(arch=arch, print_ir=False, packed=True, offline_cache=True, kernel_profiler=kernel_profiler, enable_fallback=False)
 
     @staticmethod
     def taichi_print_profiler():
@@ -358,9 +364,14 @@ class NGP_fw:
 
             self.rays_o[i] = ray_o
             self.rays_d[i] = ray_d
+    
+    @ti.ad.no_grad
+    def raymarching_test_kernel(self, N_samples: int):
+        self._raymarching_test_kernel(N_samples)
+    
 
     @ti.kernel
-    def raymarching_test_kernel(self, N_samples: int):
+    def _raymarching_test_kernel(self, N_samples: int):
 
         self.run_model_ind.fill(0)
         for n in ti.ndrange(self.counter[None]):
@@ -425,9 +436,13 @@ class NGP_fw:
             self.N_eff_samples[n] = s
             if s == 0:
                 self.alive_indices[n*2+c_index] = -1
+    
+    @ti.ad.no_grad
+    def rearange_index(self, B: ti.i32):
+        self._rearange_index(B)
 
     @ti.kernel
-    def rearange_index(self, B: ti.i32):
+    def _rearange_index(self, B: ti.i32):
         self.model_launch[None] = 0
         
         for i in ti.ndrange(B):
@@ -440,7 +455,7 @@ class NGP_fw:
         # self.padd_block_composite[None] = ((self.counter[None]+ 128 - 1)// 128) *128
 
     @ti.kernel
-    def hash_encode(self):
+    def hash_encode(self, iter_num: int):
         # get hash table embedding
         ti.loop_config(block_dim=16)
         for sn, level in ti.ndrange(self.model_launch[None], 16):
@@ -493,8 +508,8 @@ class NGP_fw:
                 local_feature_0 += data_type(w_temp[idx] * hash_temp_1[idx])
                 local_feature_1 += data_type(w_temp[idx] * hash_temp_2[idx])
 
-            self.xyzs_embedding[sn, level*2] = local_feature_0
-            self.xyzs_embedding[sn, level*2+1] = local_feature_1
+            self.xyzs_embedding[iter_num, sn, level*2] = local_feature_0
+            self.xyzs_embedding[iter_num, sn, level*2+1] = local_feature_1
 
 
     @ti.kernel
@@ -509,7 +524,7 @@ class NGP_fw:
                 for i in range(64):
                     temp = init_val[0]
                     for j in ti.static(range(32)):
-                        temp += self.xyzs_embedding[sn, j] * self.sigma_weights[i*32+j]
+                        temp += self.xyzs_embedding[iter_num, sn, j] * self.sigma_weights[i*32+j]
 
                     self.sigma_layer_hid1[iter_num, sn, i] = temp
                 
@@ -520,10 +535,10 @@ class NGP_fw:
                     self.sigma_layer_hid2[iter_num, sn, i] = temp
 
 
-                self.out_1[self.temp_hit[sn]] = data_type(ti.exp(self.sigma_layer_hid2[iter_num, sn, 0]))
+                self.out_1[iter_num, self.temp_hit[sn]] = data_type(ti.exp(self.sigma_layer_hid2[iter_num, sn, 0]))
                 for i in ti.static(range(16)):
-                    self.final_embedding[sn, i] = self.sigma_layer_hid2[iter_num, sn, i]
-                
+                    self.final_embedding[iter_num, sn, i] = self.sigma_layer_hid2[iter_num, sn, i]
+
 
     @ti.kernel
     def rgb_layer(self, iter_num : int):
@@ -539,7 +554,7 @@ class NGP_fw:
                 input = dir_encode_func(dir_)
 
                 for i in ti.static(range(16)):
-                    input[16+i] = self.final_embedding[sn, i]
+                    input[16+i] = self.final_embedding[iter_num, sn, i]
 
                 for i in range(64):
                     temp = init_val[0]
@@ -563,10 +578,10 @@ class NGP_fw:
                     self.rgb_layer_hid1[iter_num, sn, i] = temp
 
                 for i in ti.static(range(3)):
-                    self.out_3[self.temp_hit[sn], i] = data_type(1 / (1 + ti.exp(-self.rgb_layer_hid1[iter_num, sn, i])))
+                    self.out_3[iter_num, self.temp_hit[sn], i] = data_type(1 / (1 + ti.exp(-self.rgb_layer_hid1[iter_num, sn, i])))
 
     @ti.kernel
-    def composite_test(self, max_samples: ti.i32, T_threshold: data_type):
+    def composite_test(self, iter_num: int, max_samples: ti.i32, T_threshold: data_type):
         for n in ti.ndrange(self.counter[None]):
             N_samples = self.N_eff_samples[n]
             if N_samples != 0:
@@ -584,11 +599,11 @@ class NGP_fw:
 
                 for s in range(N_samples):
                     sn = start_idx + s
-                    a = data_type(1.0 - ti.exp(-self.out_1[sn]*self.deltas[sn]))
+                    a = data_type(1.0 - ti.exp(-self.out_1[iter_num, sn]*self.deltas[sn]))
                     w = a * T
 
                     for i in ti.static(range(3)):
-                        out_3_temp[i] = self.out_3[sn, i]
+                        out_3_temp[i] = self.out_3[iter_num, sn, i]
 
                     rgb_temp += w * out_3_temp
                     depth_temp[0] += w * self.ts[sn]
@@ -598,15 +613,19 @@ class NGP_fw:
 
                     if T <= T_threshold:
                         self.alive_indices[n*2+c_index] = -1
-                        break
-
+                        # break
 
                 self.rgb[r] += rgb_temp
                 self.depth[r] += depth_temp[0]
                 self.opacity[r] += opacity_temp[0]
+    
+
+    @ti.ad.no_grad
+    def re_order(self, B: ti.i32):
+        self._re_order(B)
 
     @ti.kernel
-    def re_order(self, B: ti.i32):
+    def _re_order(self, B: ti.i32):
 
         self.counter[None] = 0
         c_index = self.current_index[None]
@@ -634,26 +653,34 @@ class NGP_fw:
             self.ray_intersect_dof(dist_to_focus, len_dis)
         else:
             self.ray_intersect()
+        
+        sample_cnt = 0
+        with ti.ad.Tape(loss=self.loss):
+            while samples < max_samples:
+                N_alive = self.counter[None]
+                if N_alive == 0: break
+                # print("samples: ", samples)
+                # how many more samples the number of samples add for each ray
+                N_samples = max(min(self.N_rays//N_alive, 64), self.min_samples)
+                samples += N_samples
+                launch_model_total = N_alive * N_samples
 
-        while samples < max_samples:
-            N_alive = self.counter[None]
-            if N_alive == 0: break
-            # print("samples: ", samples)
-            # how many more samples the number of samples add for each ray
-            N_samples = max(min(self.N_rays//N_alive, 64), self.min_samples)
-            samples += N_samples
-            launch_model_total = N_alive * N_samples
+                self.raymarching_test_kernel(N_samples)
+                self.rearange_index(launch_model_total)
+                # self.dir_encode()
+                self.hash_encode(sample_cnt)
+                self.sigma_layer(sample_cnt)
+                self.rgb_layer(sample_cnt)
+                # print('padd block network ', self.padd_block_network[None])
+                self.composite_test(sample_cnt, N_samples, T_threshold)
+                self.re_order(N_alive)
 
-            self.raymarching_test_kernel(N_samples)
-            self.rearange_index(launch_model_total)
-            # self.dir_encode()
-            self.hash_encode()
-            self.sigma_layer(0)
-            self.rgb_layer(0)
-            # print('padd block network ', self.padd_block_network[None])
-            self.composite_test(N_samples, T_threshold)
-            self.re_order(N_alive)
-
+                sample_cnt += 1
+            self.compute_loss()
+        print("loss ", self.loss)
+        print("hash embedding grad ", self.hash_embedding.grad.to_numpy().sum())
+        print("sigma weight grad ", self.sigma_weights.grad.to_numpy().sum())
+        print("rgb weight grad ", self.rgb_weights.grad.to_numpy().sum())
         return samples, N_alive, N_samples
 
     def render_frame(self, frame_id):
@@ -663,6 +690,11 @@ class NGP_fw:
 
         print(f"samples: {samples}, N_alive: {N_alive}, N_samples: {N_samples}")
         print(f'Render time: {1000*(time.time()-t):.2f} ms')
+    
+    @ti.kernel
+    def compute_loss(self):
+        for I in ti.grouped(self.rgb):
+            self.loss[None] += self.rgb[I].norm()
 
     @ti.kernel
     def rgb_to_render_buffer(self, frame: ti.i32):
@@ -861,7 +893,8 @@ def main(args):
     ngp.hash_table_init()
 
     if not args.gui:
-        ngp.render_frame(0)
+        if not args.train:
+            ngp.render_frame(0)
     else:
         ngp.render_gui()
 
@@ -876,6 +909,7 @@ if __name__ == '__main__':
                         choices=['ship', 'mic', 'materials', 'lego', 'hotdog', 'ficus', 'drums', 'chair'],)
     parser.add_argument('--model_path', type=str, default=None)
     parser.add_argument('--gui', action='store_true', default=False)
+    parser.add_argument('--train', action='store_true', default=False)
     parser.add_argument('--print_profile', action='store_true', default=False)
     args = parser.parse_args()
     main(args)
